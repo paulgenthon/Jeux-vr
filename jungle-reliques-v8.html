@@ -23,14 +23,40 @@ border:0;background:#8cc35f;color:#0b140a}
 #fwd{position:fixed;left:18px;bottom:18px;width:88px;height:88px;border-radius:50%;
 border:2px solid #8cc35f;background:rgba(140,195,95,.25);color:#e8efe4;
 font:600 16px sans-serif;display:none;z-index:5;touch-action:none}
+#mask{position:fixed;left:0;top:0;width:100%;height:100%;z-index:3;pointer-events:none;display:none}
+#calib{position:fixed;left:0;top:0;right:0;bottom:0;z-index:12;display:none;background:#000;touch-action:none}
+#calCanvas{position:absolute;left:0;top:0;width:100%;height:100%}
+#calPanel{position:absolute;left:50%;bottom:6px;transform:translateX(-50%);width:min(94vw,640px);box-sizing:border-box;
+background:rgba(10,20,12,.62);border:1px solid #4d6b47;border-radius:12px;padding:6px 10px;color:#e8efe4;font:13px sans-serif;text-align:center}
+#calHint{margin:0 0 4px;color:#cfe3c8}
+#calGrid{display:grid;grid-template-columns:1fr 1fr;gap:2px 14px}
+.crow{display:flex;align-items:center;gap:6px}
+.crow label{width:86px;text-align:left}
+.crow input{flex:1;min-width:0}
+#calPanel .cbtns{display:flex;gap:8px;justify-content:center;margin-top:5px}
+#calPanel button{font:600 14px sans-serif;padding:7px 14px;border-radius:8px;border:1px solid #4d6b47;background:transparent;color:#cfe3c8}
+#calPanel button#calOk{background:#8cc35f;color:#0b140a;border:0}
 </style>
 </head>
 <body>
 <div id="stage"></div>
+<canvas id="mask"></canvas>
+<div id="calib"><canvas id="calCanvas"></canvas><div id="calPanel">
+<p id="calHint"></p>
+<div id="calGrid">
+<div class="crow"><label>Largeur</label><input type="range" id="calW"></div>
+<div class="crow"><label>Hauteur</label><input type="range" id="calH"></div>
+<div class="crow"><label>Écartement</label><input type="range" id="calSp"></div>
+<div class="crow"><label>Arrondi</label><input type="range" id="calR"></div>
+<div class="crow"><label>Haut / bas</label><input type="range" id="calY"></div>
+</div>
+<div class="cbtns"><button id="calReset">Réinitialiser</button><button id="calToggle">Masquer</button><button id="calOk">Terminé</button></div>
+</div></div>
 <div id="start"><div>
 <h1>La jungle des reliques</h1>
 <p>Tu es prisonnier de la jungle. Trouve les 5 reliques vertes, puis franchis le portail pour sortir du monde.<br>Tourne la tête pour viser, touche l'écran pour tirer.</p>
 <button id="bVR">Jouer avec le casque (marche sur place)</button><br>
+<button id="bCal" class="alt">Régler l'affichage du casque</button><br>
 <button id="bCam">Jouer avec la caméra de la pièce</button><br>
 <button id="bLook" class="alt">Avancer en regardant vers le bas : non</button><br>
 <button id="bXR" class="alt">Suivi ARCore (essai, si compatible)</button><br>
@@ -1117,6 +1143,147 @@ addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight);
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
+  if(maskOn) drawMask();
+  if(calEl.style.display === 'block') drawCal();
+});
+
+// ---------- Affichage casque : deux fenêtres arrondies, séparées ----------
+// w = largeur d'une fenêtre (part d'une demi-largeur d'écran), h = hauteur (part de l'écran),
+// sp = écartement des deux centres (1 = centres des deux moitiés d'écran), r = arrondi, y = décalage haut/bas
+const VRL_DEF = {w: 0.86, h: 0.84, sp: 1.0, r: 0.40, y: 0.0};
+const VRL = Object.assign({}, VRL_DEF);
+const VRL_LIM = {w: [0.5, 1], h: [0.4, 1], sp: [0.5, 1.5], r: [0, 0.5], y: [-0.2, 0.2]};
+try {
+  const saved = JSON.parse(localStorage.getItem('jvr_layout') || 'null');
+  if(saved) for(const k in VRL_DEF){
+    const v = saved[k];
+    if(typeof v === 'number' && isFinite(v)) VRL[k] = Math.min(VRL_LIM[k][1], Math.max(VRL_LIM[k][0], v));
+  }
+} catch(e) {}
+function saveVRL(){ try { localStorage.setItem('jvr_layout', JSON.stringify(VRL)); } catch(e) {} }
+
+function vrRects(){
+  const W = innerWidth, H = innerHeight;
+  const vw = VRL.w * W / 2, vh = VRL.h * H;
+  const sp = Math.min(2 - VRL.w, Math.max(VRL.w, VRL.sp));           // les fenêtres restent dans l'écran, sans se chevaucher
+  const cy = Math.min(H - vh / 2, Math.max(vh / 2, H / 2 + VRL.y * H));
+  return [-1, 1].map(s => {
+    const cx = W / 2 + s * sp * W / 4;
+    return {x: cx - vw / 2, y: cy - vh / 2, w: vw, h: vh};
+  });
+}
+function rrPath(ctx, x, y, w, h, r){
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+// Cache noir avec deux trous arrondis, posé par-dessus le jeu
+const maskEl = document.getElementById('mask');
+const maskCtx = maskEl.getContext('2d');
+let maskOn = false;
+function drawMask(){
+  const W = innerWidth, H = innerHeight;
+  maskEl.width = W; maskEl.height = H;
+  maskCtx.globalCompositeOperation = 'source-over';
+  maskCtx.fillStyle = '#000';
+  maskCtx.fillRect(0, 0, W, H);
+  maskCtx.globalCompositeOperation = 'destination-out';
+  maskCtx.beginPath();
+  for(const r of vrRects()) rrPath(maskCtx, r.x, r.y, r.w, r.h, VRL.r * Math.min(r.w, r.h));
+  maskCtx.fill();
+  maskCtx.globalCompositeOperation = 'source-over';
+}
+function setMask(on){
+  if(on === maskOn) return;
+  maskOn = on;
+  maskEl.style.display = on ? 'block' : 'none';
+  if(on) drawMask();
+}
+
+// Écran de réglage
+const calEl = document.getElementById('calib');
+const calC = document.getElementById('calCanvas');
+const calX = calC.getContext('2d');
+const calIds = {w: 'calW', h: 'calH', sp: 'calSp', r: 'calR', y: 'calY'};
+function drawCal(){
+  const W = innerWidth, H = innerHeight;
+  calC.width = W; calC.height = H;
+  calX.fillStyle = '#000';
+  calX.fillRect(0, 0, W, H);
+  for(const r of vrRects()){
+    const cx = r.x + r.w / 2, cy = r.y + r.h / 2;
+    calX.beginPath();
+    rrPath(calX, r.x, r.y, r.w, r.h, VRL.r * Math.min(r.w, r.h));
+    const g = calX.createRadialGradient(cx, cy, 4, cx, cy, Math.max(r.w, r.h) / 2);
+    g.addColorStop(0, '#2f5a3a');
+    g.addColorStop(1, '#16301e');
+    calX.fillStyle = g;
+    calX.fill();
+    calX.save();
+    calX.clip();
+    calX.strokeStyle = 'rgba(232,239,228,.35)';
+    calX.lineWidth = 1;
+    calX.beginPath();
+    calX.moveTo(cx, r.y); calX.lineTo(cx, r.y + r.h);
+    calX.moveTo(r.x, cy); calX.lineTo(r.x + r.w, cy);
+    calX.stroke();
+    for(let k = 1; k <= 3; k++){
+      calX.beginPath();
+      calX.ellipse(cx, cy, r.w / 2 * k / 3, r.h / 2 * k / 3, 0, 0, Math.PI * 2);
+      calX.stroke();
+    }
+    calX.restore();
+    calX.beginPath();
+    rrPath(calX, r.x, r.y, r.w, r.h, VRL.r * Math.min(r.w, r.h));
+    calX.lineWidth = 3;
+    calX.strokeStyle = '#8cc35f';
+    calX.stroke();
+  }
+  document.getElementById('calHint').textContent = H > W
+    ? 'Tourne le téléphone en mode paysage pour régler.'
+    : "Ajuste les formes vertes pour qu'elles collent à tes lentilles.";
+}
+function syncSliders(){
+  for(const k in calIds) document.getElementById(calIds[k]).value = VRL[k];
+}
+for(const k in calIds){
+  const el = document.getElementById(calIds[k]);
+  el.min = VRL_LIM[k][0]; el.max = VRL_LIM[k][1]; el.step = 0.01;
+  el.addEventListener('input', () => {
+    VRL[k] = +el.value;
+    saveVRL();
+    drawCal();
+    if(maskOn) drawMask();
+  });
+}
+syncSliders();
+document.getElementById('bCal').addEventListener('click', async () => {
+  calEl.style.display = 'block';
+  syncSliders();
+  drawCal();
+  try {
+    await document.documentElement.requestFullscreen();
+    await screen.orientation.lock('landscape');
+  } catch(e) {}
+});
+document.getElementById('calReset').addEventListener('click', () => {
+  Object.assign(VRL, VRL_DEF);
+  saveVRL(); syncSliders(); drawCal();
+});
+document.getElementById('calToggle').addEventListener('click', e => {
+  const grid = document.getElementById('calGrid');
+  const hide = grid.style.display !== 'none';
+  grid.style.display = hide ? 'none' : 'grid';
+  e.target.textContent = hide ? 'Réglages' : 'Masquer';
+});
+document.getElementById('calOk').addEventListener('click', () => {
+  calEl.style.display = 'none';
+  try { screen.orientation.unlock(); } catch(e) {}
+  try { if(document.fullscreenElement) document.exitFullscreen(); } catch(e) {}
 });
 
 // ---------- Démarrage ----------
@@ -1628,16 +1795,23 @@ function loop(id){
 
   scene.updateMatrixWorld();
   if(vr){
+    setMask(true);
+    const R = vrRects();
+    stereo.aspect = (R[0].w / R[0].h) / camera.aspect;
     stereo.update(camera);
-    const w = innerWidth / 2, h = innerHeight;
+    renderer.setScissorTest(false);
+    renderer.setViewport(0, 0, innerWidth, innerHeight);
+    renderer.setClearColor(0x000000, 1);
+    renderer.clear();
     renderer.setScissorTest(true);
-    renderer.setScissor(0, 0, w, h);
-    renderer.setViewport(0, 0, w, h);
-    renderer.render(scene, stereo.cameraL);
-    renderer.setScissor(w, 0, w, h);
-    renderer.setViewport(w, 0, w, h);
-    renderer.render(scene, stereo.cameraR);
+    for(let i = 0; i < 2; i++){
+      const r = R[i], yb = innerHeight - (r.y + r.h);
+      renderer.setScissor(r.x, yb, r.w, r.h);
+      renderer.setViewport(r.x, yb, r.w, r.h);
+      renderer.render(scene, i === 0 ? stereo.cameraL : stereo.cameraR);
+    }
   } else {
+    setMask(false);
     renderer.setScissorTest(false);
     renderer.setViewport(0, 0, innerWidth, innerHeight);
     renderer.render(scene, camera);
